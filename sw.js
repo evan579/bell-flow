@@ -1,6 +1,7 @@
 // Bell Flow service worker: keeps the app working offline.
 // Bump VERSION whenever any app file changes so phones pick up the update.
-const VERSION = 'bell-flow-v2';
+// Other apps share this github.io origin, so this worker only ever touches caches named bell-flow-*.
+const VERSION = 'bell-flow-v3';
 const FONTS = 'bell-flow-fonts';
 const SHELL = [
   './',
@@ -19,7 +20,7 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== VERSION && k !== FONTS).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k.startsWith('bell-flow-') && k !== VERSION && k !== FONTS).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
