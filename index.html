@@ -336,6 +336,13 @@ textarea.input { min-height: 84px; padding: 10px 12px; resize: vertical; }
   .stepper span { min-width: 44px; }
   .stats b { font-size: 1.8rem; }
 }
+.sync-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3); margin-right: 7px; }
+.sync-dot.ok { background: var(--good); } .sync-dot.err { background: var(--bad); } .sync-dot.busy { background: var(--accent); }
+.sync-help summary { font-weight: 700; color: var(--accent); cursor: pointer; padding: 4px 0; }
+.sync-help ol { margin-top: 8px; font-size: .92rem; }
+.sync-help a { word-break: break-all; }
+.banner.warm { background: var(--warn-soft); }
+.banner.wrap > div:first-child { min-width: 0; flex: 1 1 220px; }
 </style>
 </head>
 <body>
@@ -557,23 +564,38 @@ let saveWarned = false;
 function persist(key, val) {
   if (!LS.set(key, val) && !saveWarned) { saveWarned = true; toast('Couldn’t save on this phone. Free up some storage, then back up your log.'); }
 }
+function tombstone(ids) {
+  const now = Date.now(), del = LS.get('kb.deleted', []).filter(d => !ids.includes(d.id));
+  ids.forEach(id => del.push({ id, at: now }));
+  LS.set('kb.deleted', del);
+}
 const Store = {
-  saveProfile() { persist('kb.profile', state.profile); },
+  saveProfile() { state.profile.updatedAt = Date.now(); persist('kb.profile', state.profile); Sync.changed(); },
   saveSession(s) {
+    s.updatedAt = Date.now();
     const i = state.sessions.findIndex(x => x.id === s.id);
     if (i >= 0) state.sessions[i] = s; else state.sessions.push(s);
     state.sessions = sortSessions(state.sessions);
     persist('kb.sessions', state.sessions);
+    Sync.changed();
   },
   deleteSession(id) {
     state.sessions = state.sessions.filter(x => x.id !== id);
     persist('kb.sessions', state.sessions);
+    tombstone([id]);
+    Sync.changed();
   },
-  replace(sessions, profile) {
+  // Restore and erase. dropOthers marks sessions missing from the new list as deleted, so sync doesn't bring them back.
+  replace(sessions, profile, opts = {}) {
+    const now = Date.now(), here = new Set(state.sessions.map(s => s.id)), incoming = new Set(sessions.map(s => s.id));
+    if (opts.dropOthers) tombstone(state.sessions.filter(s => !incoming.has(s.id)).map(s => s.id));
+    sessions.forEach(s => { if (opts.dropOthers || !here.has(s.id)) s.updatedAt = now; });
+    LS.set('kb.deleted', LS.get('kb.deleted', []).filter(d => !incoming.has(d.id)));
     state.sessions = sortSessions(sessions);
-    state.profile = { ...DEFAULT_PROFILE, ...profile };
+    state.profile = { ...DEFAULT_PROFILE, ...profile, updatedAt: now };
     persist('kb.sessions', state.sessions);
     persist('kb.profile', state.profile);
+    Sync.changed();
   }
 };
 
@@ -793,7 +815,8 @@ function viewToday() {
     html += `<div class="banner wrap" style="margin-top:12px"><div><p>Install Bell Flow on your iPhone</p><span class="small">In Safari, tap the Share button, then <b>Add to Home Screen</b>. Log workouts in the installed app: it keeps its own log, separate from Safari.</span></div><button class="btn sm" data-act="install-hide">Hide</button></div>`;
   }
   const lb = p.lastBackup;
-  if (state.sessions.length >= 3 && (!lb || daysBetween(lb, t) >= 30) && !(p.backupSnooze && p.backupSnooze > t)) {
+  html += Sync.bannerHtml();
+  if (!Sync.on() && state.sessions.length >= 3 && (!lb || daysBetween(lb, t) >= 30) && !(p.backupSnooze && p.backupSnooze > t)) {
     html += `<div class="banner wrap" style="margin-top:12px"><div><p>Back up your log</p><span class="small">${lb ? `Your last backup was ${daysBetween(lb, t)} days ago.` : 'You haven’t made a backup yet.'} A backup keeps your history safe if you delete the app or change phones.</span></div><div class="row" style="flex-wrap:nowrap"><button class="btn sm" data-act="backup-later">Later</button><button class="btn primary sm" data-act="backup">Back up</button></div></div>`;
   }
   if (!p.welcomed) {
@@ -1098,7 +1121,8 @@ function openSettings() {
     <div class="field"><span class="lbl">Program</span><div class="row" style="flex-wrap:nowrap"><label for="jump" class="small muted" style="white-space:nowrap">Start from</label><select class="select" id="jump" style="flex:1">${weeks.map(w => `<option value="${w}" ${(p.startWeek || 1) === w ? 'selected' : ''}>Week ${w}</option>`).join('')}</select></div>
       <button class="btn sm" data-act="new-cycle" style="justify-self:start">Restart program as round ${p.cycle + 1}</button>
       <p class="hint">Restarting keeps your history. Weight suggestions carry over.</p></div>
-    <div class="field"><span class="lbl">Your data</span><p class="small muted">Your log lives on this phone, inside the app. If you remove the app from your Home Screen, its data goes with it, so back up now and then. Save backups to Files or iCloud Drive.</p>
+    ${Sync.fieldHtml()}
+    <div class="field"><span class="lbl">Your data</span><p class="small muted">${Sync.on() ? 'Your log is synced to GitHub, so it’s safe if you update or remove the app. File backups are an optional extra copy.' : 'Your log lives on this phone, inside the app. If you remove the app from your Home Screen, its data goes with it. Turn on sync above, or back up now and then to Files or iCloud Drive.'}</p>
       <p class="small">Last backup: <b>${p.lastBackup ? fmtDay(p.lastBackup) : 'never'}</b></p>
       <div class="row"><button class="btn sm primary" data-act="backup">Back up now</button><button class="btn sm" data-act="restore-pick">Restore from backup</button></div>
       <div class="row"><button class="btn sm" data-act="export">Export CSV</button><button class="btn sm danger" data-act="wipe-ask">Erase all sessions</button></div><div id="wipe-confirm"></div></div>`, 'settings');
@@ -1391,7 +1415,7 @@ function readBackup(file) {
 function applyRestore(mode) {
   const d = sheetCtx && sheetCtx.data; if (!d) return;
   if (mode === 'replace') {
-    Store.replace(d.sessions, { ...d.profile, welcomed: true });
+    Store.replace(d.sessions, { ...d.profile, welcomed: true }, { dropOthers: true });
     toast(`Restored ${d.sessions.length} sessions`);
   } else {
     const map = new Map(state.sessions.map(x => [x.id, x]));
@@ -1502,9 +1526,208 @@ document.addEventListener('change', e => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet(); });
 
+const SYNC_CFG = {
+  app: 'bell-flow', file: 'bell-flow.json', prefix: 'kb', label: 'Bell Flow',
+  count: () => state.sessions.length,
+  snapshot: () => ({ profile: state.profile, sessions: state.sessions, deleted: LS.get('kb.deleted', []) }),
+  apply(d) {
+    state.sessions = sortSessions(d.sessions);
+    state.profile = { ...DEFAULT_PROFILE, ...d.profile };
+    persist('kb.sessions', state.sessions);
+    persist('kb.profile', state.profile);
+    LS.set('kb.deleted', d.deleted);
+    render();
+    if (sheetCtx && sheetCtx.type === 'settings') openSettings();
+  }
+};
+/* ---------------- sync to a private GitHub repo ---------------- */
+// Every save, edit or delete is pushed to <repo>/<file> on GitHub. On open, the app pulls and merges:
+// sessions are matched by id (the newer edit wins) and deletions are remembered, so nothing comes back by accident.
+const Sync = (() => {
+  const C = SYNC_CFG;
+  const K = { cfg: C.prefix + '.sync', del: C.prefix + '.deleted', nudge: C.prefix + '.syncNudge' };
+  let cfg = { repo: 'evan579/fitness-log', token: '', lastSync: 0, error: null, dirty: false, ...LS.get(K.cfg, {}) };
+  let busy = false, again = false, timer = null, status = cfg.token ? (cfg.error ? 'error' : 'idle') : 'off', lastMode = null;
+  const save = () => LS.set(K.cfg, cfg);
+  const tAt = s => s.updatedAt || s.endedAt || 0;
+  const b64enc = str => { const b = new TextEncoder().encode(str); let bin = ''; for (let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(bin); };
+  const b64dec = s => { const bin = atob(s.replace(/\s/g, '')); const b = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); return new TextDecoder().decode(b); };
+  const byId = (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  const norm = d => JSON.stringify({ p: d.profile || {}, s: (d.sessions || []).slice().sort(byId), d: (d.deleted || []).slice().sort(byId) });
+  function merge(a, b) {
+    const del = new Map();
+    for (const x of [...(a.deleted || []), ...(b.deleted || [])]) if (x && x.id && (!del.has(x.id) || del.get(x.id) < x.at)) del.set(x.id, x.at);
+    const map = new Map();
+    for (const s of [...(a.sessions || []), ...(b.sessions || [])]) { if (!s || !s.id) continue; const cur = map.get(s.id); if (!cur || tAt(s) > tAt(cur)) map.set(s.id, s); }
+    for (const [id, at] of del) { const s = map.get(id); if (s && tAt(s) <= at) map.delete(id); }
+    const pa = a.profile || {}, pb = b.profile || {};
+    // Newer settings win. On a tie (older versions never dated them), the copy already on GitHub wins, so a fresh install picks up your settings.
+    const ta = pa.updatedAt || 0, tb = pb.updatedAt || 0;
+    const profile = tb > ta || (tb === ta && Object.keys(pb).length > 0) ? pb : pa;
+    return { profile, sessions: [...map.values()], deleted: [...del].map(([id, at]) => ({ id, at })) };
+  }
+  class SyncError extends Error { constructor(kind, msg) { super(msg || kind); this.kind = kind; } }
+  async function api(path, opts = {}) {
+    try {
+      return await fetch('https://api.github.com' + path, { ...opts, cache: 'no-store', headers: { Authorization: 'Bearer ' + cfg.token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...(opts.headers || {}) } });
+    } catch (e) { throw new SyncError('offline'); }
+  }
+  async function fail(res) {
+    let msg = ''; try { msg = (await res.json()).message || ''; } catch (e) {}
+    if (res.status === 401) throw new SyncError('token', msg);
+    if (res.status === 429 || (res.status === 403 && /rate limit/i.test(msg))) throw new SyncError('rate', msg);
+    if (res.status === 403) throw new SyncError('perm', msg);
+    if (res.status === 404) throw new SyncError('repo', msg);
+    throw new SyncError('other', `GitHub said ${res.status}${msg ? ': ' + msg : ''}`);
+  }
+  const filePath = () => `/repos/${cfg.repo}/contents/${encodeURIComponent(C.file)}`;
+  async function readRemote() {
+    const res = await api(filePath());
+    if (res.status === 404) { const r = await api(`/repos/${cfg.repo}`); if (r.ok) return { data: null, sha: null }; await fail(r); }
+    if (!res.ok) await fail(res);
+    const j = await res.json();
+    let text;
+    if (j.encoding === 'base64' && j.content) text = b64dec(j.content);
+    else { const r = await api(filePath(), { headers: { Accept: 'application/vnd.github.raw+json' } }); if (!r.ok) await fail(r); text = await r.text(); }
+    let data; try { data = JSON.parse(text); } catch (e) { throw new SyncError('file', `${C.file} on GitHub isn’t readable.`); }
+    if (!data || data.app !== C.app || !Array.isArray(data.sessions)) throw new SyncError('file', `${C.file} on GitHub isn’t a ${C.label} log.`);
+    return { data, sha: j.sha };
+  }
+  async function writeRemote(d, sha) {
+    const n = d.sessions.length;
+    const body = { message: `${C.label}: ${n} session${n === 1 ? '' : 's'}`, content: b64enc(JSON.stringify({ app: C.app, format: 1, updatedAt: new Date().toISOString(), profile: d.profile, sessions: d.sessions, deleted: d.deleted }, null, 1)) };
+    if (sha) body.sha = sha;
+    const res = await api(filePath(), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (res.status === 409 || res.status === 422) return false; // another device saved first: re-read, merge, try again
+    if (!res.ok) await fail(res);
+    return true;
+  }
+  async function run() {
+    if (!cfg.token) return;
+    if (busy) { again = true; return; }
+    busy = true; setStatus('syncing');
+    let brought = 0;
+    try {
+      let done = false;
+      for (let attempt = 0; attempt < 4 && !done; attempt++) {
+        const remote = await readRemote();
+        const local = C.snapshot();
+        const merged = merge(local, remote.data || {});
+        if (norm(merged) !== norm(local)) {
+          const before = new Set((local.sessions || []).map(s => s.id));
+          brought += merged.sessions.filter(s => !before.has(s.id)).length;
+          C.apply(merged);
+        }
+        if (remote.data && norm(merged) === norm(remote.data)) done = true;
+        else done = await writeRemote(merged, remote.sha);
+      }
+      if (!done) throw new SyncError('other', 'Another device kept saving at the same moment.');
+      cfg.lastSync = Date.now(); cfg.error = null; cfg.dirty = false; save(); setStatus('ok');
+      if (brought) toast(`Brought back ${brought} session${brought === 1 ? '' : 's'} from GitHub`);
+    } catch (e) {
+      cfg.error = { kind: e.kind || 'other', msg: String(e.message || '') }; save(); setStatus('error');
+      if (e.kind === 'rate' || e.kind === 'other') schedule(60000);
+    } finally {
+      busy = false;
+      if (again) { again = false; schedule(800); }
+    }
+  }
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(run, ms); }
+  const ago = t => { const s = (Date.now() - t) / 1000; return s < 60 ? 'just now' : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); };
+  const MSG = {
+    offline: 'Waiting for a connection. Your log is safe on this phone and will sync when you’re back online.',
+    token: 'GitHub didn’t accept the access token. It may have expired or been mistyped.',
+    perm: 'The token can’t save to that repository. In the token’s settings, set Contents to Read and write.',
+    repo: 'Can’t find that repository, or the token doesn’t include it. Check the name and the token’s repository access.',
+    rate: 'GitHub is limiting requests for a moment. Sync will retry by itself.',
+    file: '',
+    other: ''
+  };
+  const needsFix = () => cfg.token && cfg.error && ['token', 'perm', 'repo', 'file'].includes(cfg.error.kind);
+  function statusText() {
+    if (!cfg.token) return 'Off';
+    if (status === 'syncing') return 'Syncing…';
+    if (cfg.error) return MSG[cfg.error.kind] || `Sync didn’t finish: ${cfg.error.msg}. It will retry.`;
+    if (cfg.dirty) return 'Changes waiting to sync.';
+    return cfg.lastSync ? `Synced ${ago(cfg.lastSync)}.` : 'Connected.';
+  }
+  const dotCls = () => !cfg.token ? '' : status === 'syncing' ? 'busy' : cfg.error && cfg.error.kind !== 'offline' ? 'err' : 'ok';
+  function setStatus(s) {
+    status = s;
+    const el = document.getElementById('sync-status');
+    if (el) { el.textContent = statusText(); const d = document.getElementById('sync-dot'); if (d) d.className = 'sync-dot ' + dotCls(); }
+    const mode = !cfg.token ? 'off' : needsFix() ? 'fix:' + cfg.error.kind : 'on';
+    if (mode !== lastMode) {
+      lastMode = mode;
+      const f = document.getElementById('sync-field'), a = document.activeElement;
+      if (f && !(a && f.contains(a) && a.tagName === 'INPUT')) f.outerHTML = fieldHtml();
+      if (state.tab === 'today' && !document.querySelector('#view input:focus')) render();
+    }
+  }
+  const tokenInputs = (cta) => `<label for="sync-repo">Repository</label><input class="input" id="sync-repo" value="${esc(cfg.repo)}" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url">
+      <label for="sync-token">Access token</label><input class="input" id="sync-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…">
+      <p class="hint">The token stays on this phone and only opens that one repository.</p>
+      <div><button class="btn sm primary" data-act="sync-connect">${cta}</button></div>`;
+  const steps = `<details class="sync-help"${cfg.token ? '' : ' open'}><summary>How to set it up</summary><ol class="cues">
+      <li>On GitHub, create a <b>private</b> repository named <b>fitness-log</b>.</li>
+      <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a>. Name the token “Fitness apps sync” and choose the longest expiration offered.</li>
+      <li>Under <b>Repository access</b>, choose <b>Only select repositories</b>, then <b>fitness-log</b>.</li>
+      <li>Under <b>Permissions</b>, add <b>Contents</b> and set it to <b>Read and write</b>.</li>
+      <li>Tap <b>Generate token</b>, copy it, and paste it below.</li></ol></details>`;
+  function fieldHtml() {
+    lastMode = !cfg.token ? 'off' : needsFix() ? 'fix:' + cfg.error.kind : 'on';
+    if (!cfg.token) return `<div class="field" id="sync-field"><span class="lbl">Sync to GitHub</span>
+      <p class="small muted">Saves every session to a private GitHub repository, so app updates, deleting the app or a new phone never lose your history. Bell Flow and Limber can share the same repository.</p>
+      ${steps}${tokenInputs('Connect and sync')}</div>`;
+    return `<div class="field" id="sync-field"><span class="lbl">Sync to GitHub</span>
+      <p class="small"><span class="sync-dot ${dotCls()}" id="sync-dot"></span><span id="sync-status">${esc(statusText())}</span></p>
+      <p class="small muted">Saving to ${esc(cfg.repo)}, file ${esc(C.file)}.</p>
+      ${needsFix() ? steps + tokenInputs('Save and sync') : `<div class="row"><button class="btn sm" data-act="sync-now">Sync now</button><button class="btn sm danger" data-act="sync-disconnect">Disconnect</button></div>`}</div>`;
+  }
+  function bannerHtml() {
+    if (needsFix()) return `<div class="banner wrap warm" style="margin-top:12px"><div><p>Sync has stopped</p><span class="small">${esc(MSG[cfg.error.kind] || cfg.error.msg)}</span></div><button class="btn sm primary" data-act="sync-fix">Fix</button></div>`;
+    if (!cfg.token && C.count() >= 1 && LS.get(K.nudge, '') !== 'hide') return `<div class="banner wrap" style="margin-top:12px"><div><p>Keep your history safe</p><span class="small">Turn on sync so app updates, deleting the app or a new phone never lose a session.</span></div><div class="row" style="flex-wrap:nowrap"><button class="btn sm" data-act="sync-nudge-hide">Not now</button><button class="btn sm primary" data-act="sync-fix">Set up</button></div></div>`;
+    return '';
+  }
+  async function connect() {
+    const repo = (document.getElementById('sync-repo') || {}).value || cfg.repo;
+    const token = ((document.getElementById('sync-token') || {}).value || '').trim();
+    const r = repo.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+    if (!/^[\w.-]+\/[\w.-]+$/.test(r)) { toast('Enter the repository as username/name, like evan579/fitness-log'); return; }
+    if (!token) { toast('Paste your access token first'); return; }
+    cfg.repo = r; cfg.token = token; cfg.error = null; save();
+    toast('Connecting…');
+    await run();
+    if (!cfg.error) toast(`Synced with ${cfg.repo}`);
+    else if (!needsFix()) toast(statusText());
+    if (typeof sheetCtx !== 'undefined' && sheetCtx && sheetCtx.type === 'settings') openSettings();
+  }
+  document.addEventListener('click', e => {
+    const el = e.target.closest('[data-act^="sync-"]'); if (!el) return;
+    switch (el.dataset.act) {
+      case 'sync-connect': connect(); break;
+      case 'sync-now': cfg.error = null; run(); break;
+      case 'sync-disconnect': cfg.token = ''; cfg.error = null; save(); setStatus('off'); openSettings(); toast('Sync turned off. Your log stays on this phone.'); break;
+      case 'sync-fix': openSettings(); setTimeout(() => { const f = document.getElementById('sync-field'); if (f) f.scrollIntoView({ block: 'start' }); }, 50); break;
+      case 'sync-nudge-hide': LS.set(K.nudge, 'hide'); render(); break;
+    }
+  });
+  return {
+    on: () => !!cfg.token,
+    changed() { cfg.dirty = true; save(); if (cfg.token) schedule(1500); },
+    start() {
+      if (cfg.token) run();
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && cfg.token && (cfg.dirty || Date.now() - cfg.lastSync > 60000)) run(); });
+      window.addEventListener('online', () => { if (cfg.token) run(); });
+    },
+    fieldHtml, bannerHtml, merge, run
+  };
+})();
+
 /* ---------------- boot ---------------- */
 let swReg = null, swUpdating = false;
 render();
+Sync.start();
 try { navigator.storage && navigator.storage.persist && navigator.storage.persist().catch(() => {}); } catch (e) {}
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   window.addEventListener('load', () => {
