@@ -1,6 +1,6 @@
 // Bell Flow service worker: keeps the app working offline.
 // Bump VERSION whenever any app file changes so phones pick up the update.
-const VERSION = 'bell-flow-v1';
+const VERSION = 'bell-flow-v2';
 const FONTS = 'bell-flow-fonts';
 const SHELL = [
   './',

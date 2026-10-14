@@ -294,6 +294,7 @@ p { margin: 0; }
 .tm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
 .tm-label { font-size: .78rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--slab-mute); }
 .tm-time { font-family: var(--f-display); font-weight: 800; font-size: 4.6rem; line-height: .9; font-variant-numeric: tabular-nums; }
+.timer.pause .tm-label, .timer.pause .tm-time { color: var(--slab-up); }
 .tm-next { color: var(--slab-mute); font-size: .92rem; }
 .tm-bar { height: 6px; border-radius: 99px; background: var(--slab-2); overflow: hidden; }
 .tm-bar i { display: block; height: 100%; width: 0; background: var(--accent); }
@@ -1271,10 +1272,14 @@ function markSet(si, done) {
 function startRest(secs, label) {
   Timer.start({ type: 'rest', phases: [{ label: 'Rest', secs }], next: label, onDone: () => { beep(660, .25); buzz([80, 60, 80]); } });
 }
+const SWITCH_SECS = 5; // pause between left and right on timed one-side moves
 function startWork(si) {
   const a = state.active, it = a.items[a.idx], s = it.sets[si];
-  const phases = it.per ? [{ label: 'Left side', secs: s.secs }, { label: 'Right side', secs: s.secs }] : [{ label: 'Hold', secs: s.secs }];
-  Timer.start({ type: 'work', phases, next: EX[it.ex].name, onPhase: () => { beep(880, .2); buzz(150); }, onDone: () => { beep(990, .35); markSet(si, true); } });
+  const name = EX[it.ex].name;
+  const phases = it.per
+    ? [{ label: 'Left side', secs: s.secs, next: name }, { label: 'Switch sides', secs: SWITCH_SECS, next: 'Get set on your right side', pause: true }, { label: 'Right side', secs: s.secs, next: name }]
+    : [{ label: 'Hold', secs: s.secs, next: name }];
+  Timer.start({ type: 'work', phases, next: name, onPhase: pi => { beep(phases[pi].pause ? 660 : 880, .2); buzz(phases[pi].pause ? [100, 60, 100] : 150); }, onDone: () => { beep(990, .35); markSet(si, true); } });
 }
 function startEmom() {
   const a = state.active, it = a.items[a.idx], idx = a.idx;
@@ -1303,7 +1308,7 @@ const Timer = {
     if (rem <= 0) {
       if (t.pi < t.phases.length - 1) {
         t.pi++; t.total = t.phases[t.pi].secs; t.endsAt = Date.now() + t.total * 1000; t.lastSec = null;
-        const lb = $('#tm-label'); if (lb) lb.textContent = t.phases[t.pi].label;
+        paintPhase(t);
         t.onPhase && t.onPhase(t.pi);
       } else {
         const done = t.onDone; this.stop(); done && done();
@@ -1313,11 +1318,16 @@ const Timer = {
   add(s) { if (this.t) { this.t.endsAt += s * 1000; this.t.total += s; } },
   stop() { clearInterval(this.iv); this.iv = null; this.t = null; const el = $('#timer'); if (el) el.hidden = true; }
 };
+function paintPhase(t) {
+  const ph = t.phases[t.pi], el = $('#timer'), lb = $('#tm-label'), nx = $('#tm-next');
+  if (lb) lb.textContent = ph.label;
+  if (nx) nx.textContent = ph.next || t.next || '';
+  if (el) el.classList.toggle('pause', !!ph.pause);
+}
 function showTimer() {
   const t = Timer.t, el = $('#timer'); if (!t || !el) return;
   el.hidden = false;
-  $('#tm-label').textContent = t.phases[t.pi].label;
-  $('#tm-next').textContent = t.next || '';
+  paintPhase(t);
   $('#tm-actions').innerHTML = t.type === 'rest' ? `<button class="btn" data-act="tm-add">+15s</button><button class="btn" data-act="tm-skip">Skip rest</button>` : `<button class="btn" data-act="tm-skip" style="grid-column:1/-1">${t.type === 'emom' ? 'Stop clock' : 'Stop timer'}</button>`;
   Timer.tick();
 }
